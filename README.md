@@ -2,7 +2,7 @@
 
 A lightweight Windows system tray utility for per-monitor DPI scaling and display management.
 
-Right-click the tray icon to adjust scaling, resolution, and refresh rate for each connected monitor - no restart required.
+Right-click the tray icon to adjust scaling, resolution, and refresh rate for each connected monitor, without requiring a restart.
 
 ## Features
 
@@ -16,7 +16,7 @@ Right-click the tray icon to adjust scaling, resolution, and refresh rate for ea
 
 ## How It Works
 
-ScaleSwitch uses the undocumented `DisplayConfigSetDeviceInfo` API (type `-4`) - the same mechanism Windows Settings uses internally to apply DPI changes. This allows instant scaling without requiring a session restart.
+ScaleSwitch uses the undocumented `DisplayConfigSetDeviceInfo` API (type `-4`), the same mechanism Windows Settings uses internally to apply DPI changes. This allows instant scaling without requiring a session restart.
 
 Monitor enumeration relies on `D3DKMTOpenAdapterFromGdiDisplayName` to obtain adapter LUIDs, which works reliably for all connected displays regardless of `QueryDisplayConfig` coverage.
 
@@ -58,10 +58,6 @@ The executable is output to `dist/ScaleSwitch.exe`.
 - Windows 10 or later
 - Python 3.8+ (only when running from source)
 
-## License
-
-[MIT](LICENSE)
-
 ## Star History
 
 <a href="https://www.star-history.com/?repos=infinition%2FScaleSwitch&type=date&legend=top-left">
@@ -71,3 +67,7 @@ The executable is output to `dist/ScaleSwitch.exe`.
    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=infinition/ScaleSwitch&type=date&legend=top-left" />
  </picture>
 </a>
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -3,25 +3,29 @@ ScaleSwitch — Per-monitor DPI scaling from the system tray.
 Lightweight, fast, single-file Windows utility.
 
 Right-click tray icon → pick monitor → adjust scaling with +/- or preset buttons.
-Includes startup-with-Windows toggle and clean exit.
+Includes startup-with-Windows toggle, per-monitor favorites with auto-restore,
+screen rotation and clean exit.
 
 Uses undocumented DisplayConfigSetDeviceInfo(-4) for instant DPI changes.
 """
 
 import ctypes
 import ctypes.wintypes
+import json
 import os
 import sys
 import threading
 import winreg
+from pathlib import Path
 
 import pystray
+from pystray._util import win32 as _pystray_win32
 from PIL import Image, ImageDraw, ImageFont
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 APP_NAME = "ScaleSwitch"
-APP_VERSION = "1.2"
+APP_VERSION = "1.4"
 SCALE_PRESETS = [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500]
 DPI_VALS = SCALE_PRESETS  # All known DPI percentage values
 SCALE_STEP = 25
@@ -29,6 +33,10 @@ SCALE_MIN = 100
 SCALE_MAX = 500
 
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+# Favorites are stored per monitor device path under %APPDATA%\ScaleSwitch
+CONFIG_DIR = Path(os.environ.get("APPDATA", ".")) / APP_NAME
+FAVORITES_FILE = CONFIG_DIR / "favorites.json"
 
 # Windows API constants
 QDC_ONLY_ACTIVE_PATHS = 0x00000002
@@ -43,11 +51,36 @@ DM_BITSPERPEL = 0x00040000
 DM_PELSWIDTH = 0x00080000
 DM_PELSHEIGHT = 0x00100000
 DM_DISPLAYFREQUENCY = 0x00400000
+DM_DISPLAYORIENTATION = 0x00000080
+
+# Display orientation values (dmDisplayOrientation)
+DMDO_DEFAULT = 0
+DMDO_90 = 1
+DMDO_180 = 2
+DMDO_270 = 3
 
 # ChangeDisplaySettingsEx flags and return codes
 CDS_UPDATEREGISTRY = 0x00000001
 DISP_CHANGE_SUCCESSFUL = 0
 ENUM_CURRENT_SETTINGS = -1
+
+# ─── Favorites Storage ───────────────────────────────────────────────────────
+
+def load_favorites() -> dict:
+    """Load saved favorites. Returns {} when missing or unreadable."""
+    if FAVORITES_FILE.is_file():
+        try:
+            return json.loads(FAVORITES_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Failed to load favorites: {e}")
+    return {}
+
+
+def save_favorites(data: dict):
+    """Persist favorites to disk, creating the config directory if needed."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    FAVORITES_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 # ─── Win32 Structures ────────────────────────────────────────────────────────
 
@@ -369,6 +402,51 @@ def set_display_mode(gdi_name: str, width: int, height: int, refresh_rate: int =
     return True
 
 
+def get_display_orientation(gdi_name: str) -> int:
+    """Return the current dmDisplayOrientation for a monitor."""
+    dm = DEVMODEW()
+    dm.dmSize = ctypes.sizeof(DEVMODEW)
+    if user32.EnumDisplaySettingsExW(gdi_name, ENUM_CURRENT_SETTINGS, ctypes.byref(dm), 0):
+        return dm.u.display.dmDisplayOrientation
+    return DMDO_DEFAULT
+
+
+def set_display_orientation(gdi_name: str, orientation: int):
+    """Rotate a monitor to the given DMDO_* orientation.
+
+    Width and height are swapped when switching between landscape and
+    portrait, otherwise Windows rejects the mode.
+    """
+    dm = DEVMODEW()
+    dm.dmSize = ctypes.sizeof(DEVMODEW)
+    if not user32.EnumDisplaySettingsExW(gdi_name, ENUM_CURRENT_SETTINGS, ctypes.byref(dm), 0):
+        raise RuntimeError("Cannot read current display settings")
+
+    width, height = dm.dmPelsWidth, dm.dmPelsHeight
+    was_portrait = dm.u.display.dmDisplayOrientation % 2
+    will_be_portrait = orientation % 2
+    if was_portrait != will_be_portrait:
+        width, height = height, width
+
+    dm.u.display.dmDisplayOrientation = orientation
+    dm.dmPelsWidth = width
+    dm.dmPelsHeight = height
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION
+
+    ret = user32.ChangeDisplaySettingsExW(gdi_name, ctypes.byref(dm), None, CDS_UPDATEREGISTRY, None)
+    if ret != DISP_CHANGE_SUCCESSFUL:
+        raise RuntimeError(f"ChangeDisplaySettingsExW failed (error {ret})")
+    return True
+
+
+def toggle_display_orientation(gdi_name: str) -> int:
+    """Flip a monitor between landscape and portrait. Returns the new orientation."""
+    current = get_display_orientation(gdi_name)
+    new_orientation = DMDO_DEFAULT if current != DMDO_DEFAULT else DMDO_90
+    set_display_orientation(gdi_name, new_orientation)
+    return new_orientation
+
+
 def get_monitor_info_list():
     """Return list of all real monitors with DPI info.
 
@@ -422,21 +500,27 @@ def get_monitor_info_list():
         if not dpi_info:
             continue
 
-        # Try to get friendly name via display config target
+        # Friendly name + stable device path via display config target
         friendly_name = gdi_name
+        device_path = ""
         try:
-            friendly_name = _get_friendly_name(adapter_id, source_id) or gdi_name
+            target_info = _get_target_device_info(adapter_id, source_id)
+            if target_info:
+                friendly_name = target_info["name"] or gdi_name
+                device_path = target_info["device_path"] or ""
         except Exception:
             pass
 
         # Get display modes (resolution + refresh rates)
         current_mode = get_current_display_mode(gdi_name)
         resolutions, hz_map = get_display_modes(gdi_name)
+        orientation = get_display_orientation(gdi_name)
 
         monitors.append({
             "index": idx + 1,
             "gdi_name": gdi_name,
             "friendly_name": friendly_name,
+            "device_path": device_path,
             "adapter_lo": adapter_info["adapter_lo"],
             "adapter_hi": adapter_info["adapter_hi"],
             "source_id": source_id,
@@ -450,13 +534,18 @@ def get_monitor_info_list():
             "current_hz": current_mode["hz"] if current_mode else 60,
             "resolutions": resolutions,
             "hz_map": hz_map,
+            "orientation": orientation,
         })
 
     return monitors
 
 
-def _get_friendly_name(adapter_id: LUID, source_id: int) -> str:
-    """Try to get the monitor friendly name by finding the matching target in QueryDisplayConfig."""
+def _get_target_device_info(adapter_id: LUID, source_id: int):
+    """Find the display config target for a source and return its friendly
+    name plus the stable monitor device path.
+
+    The device path is the favorites key — it survives reboots and GDI
+    renumbering, unlike \\\\.\\DISPLAYn."""
     num_paths = ctypes.c_uint32()
     num_modes = ctypes.c_uint32()
     ret = user32.GetDisplayConfigBufferSizes(
@@ -488,7 +577,10 @@ def _get_friendly_name(adapter_id: LUID, source_id: int) -> str:
             tgt.header.adapterId = p.targetInfo.adapterId
             tgt.header.id = p.targetInfo.id
             if user32.DisplayConfigGetDeviceInfo(ctypes.byref(tgt)) == 0:
-                return tgt.monitorFriendlyDeviceName or None
+                return {
+                    "name": tgt.monitorFriendlyDeviceName or None,
+                    "device_path": tgt.monitorDevicePath or None,
+                }
     return None
 
 
@@ -573,10 +665,20 @@ def create_tray_icon(scale_value: int = 0) -> Image.Image:
 
 # ─── Tray Application ────────────────────────────────────────────────────────
 
+class _TrayIcon(pystray.Icon):
+    """pystray.Icon that also opens the menu on left-click.
+    Windows only raises the context menu for WM_RBUTTONUP by default."""
+
+    def _on_notify(self, wparam, lparam):
+        if lparam == _pystray_win32.WM_LBUTTONUP:
+            lparam = _pystray_win32.WM_RBUTTONUP
+        super()._on_notify(wparam, lparam)
+
+
 class ScaleSwitchApp:
     def __init__(self):
         self.icon: pystray.Icon = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def _get_monitors(self):
         """Safely get monitors."""
@@ -588,6 +690,7 @@ class ScaleSwitchApp:
     def _build_menu(self):
         """Build the context menu dynamically with current monitor states."""
         monitors = self._get_monitors()
+        favorites = load_favorites()
         items = []
 
         # Header
@@ -602,8 +705,8 @@ class ScaleSwitchApp:
             cr = mon["current_res"]
             primary_tag = "  [Primary]" if mon["primary"] else ""
             header = (
-                f'{mon["friendly_name"]} \u2014 '
-                f'{cr[0]}\u00d7{cr[1]} @ {mon["current_hz"]} Hz{primary_tag}'
+                f'{mon["friendly_name"]} — '
+                f'{cr[0]}×{cr[1]} @ {mon["current_hz"]} Hz{primary_tag}'
             )
             items.append(pystray.MenuItem(header, None, enabled=False))
 
@@ -617,6 +720,24 @@ class ScaleSwitchApp:
                 f'  Scale: {mon["scale"]}%{rec_label}',
                 None, enabled=False
             ))
+
+            # Quick favorite actions for this monitor
+            dev_path = mon["device_path"]
+            fav = favorites.get(dev_path, None)
+            has_secondary = fav and "secondary" in fav
+
+            if fav:
+                items.append(pystray.MenuItem(
+                    '  ▶ Restore Favorite (Primary)',
+                    self._make_restore_favorite_handler(mon)
+                ))
+            if has_secondary:
+                items.append(pystray.MenuItem(
+                    '  ▶ Secondary Mode',
+                    self._make_apply_secondary_handler(mon)
+                ))
+
+            items.append(pystray.Menu.SEPARATOR)
 
             # Preset buttons as submenu
             a_lo, a_hi, s_id = mon["adapter_lo"], mon["adapter_hi"], mon["source_id"]
@@ -653,13 +774,13 @@ class ScaleSwitchApp:
             res_items = []
             for rw, rh in mon["resolutions"]:
                 res_items.append(pystray.MenuItem(
-                    f'{rw}\u00d7{rh}',
+                    f'{rw}×{rh}',
                     self._make_resolution_handler(gdi, rw, rh, mon["hz_map"]),
                     checked=lambda item, r=(rw, rh), c=cur_res: r == c,
                 ))
             if res_items:
                 items.append(pystray.MenuItem(
-                    f'  Resolution: {cur_res[0]}\u00d7{cur_res[1]}',
+                    f'  Resolution: {cur_res[0]}×{cur_res[1]}',
                     pystray.Menu(*res_items)
                 ))
 
@@ -677,6 +798,91 @@ class ScaleSwitchApp:
                     f'  Refresh Rate: {cur_hz} Hz',
                     pystray.Menu(*hz_items)
                 ))
+
+            # Rotation toggle
+            orientation = mon.get("orientation", DMDO_DEFAULT)
+            is_portrait = orientation in (DMDO_90, DMDO_270)
+            rotate_label = (
+                '  ⟳ Rotate to Landscape' if is_portrait else '  ⟳ Rotate to Portrait'
+            )
+            items.append(pystray.MenuItem(
+                rotate_label,
+                self._make_rotate_handler(gdi)
+            ))
+
+            # Save / remove favorites for this monitor
+            items.append(pystray.Menu.SEPARATOR)
+
+            items.append(pystray.MenuItem(
+                '  ☆ Save as Favorite (Primary)',
+                self._make_save_favorite_handler(mon)
+            ))
+
+            items.append(pystray.MenuItem(
+                '  ☆ Save as Secondary',
+                self._make_save_secondary_handler(mon)
+            ))
+
+            if fav:
+                items.append(pystray.MenuItem(
+                    '  ✖ Remove Favorites',
+                    self._make_remove_favorite_handler(dev_path)
+                ))
+
+            items.append(pystray.Menu.SEPARATOR)
+
+        # Favorites submenu (every saved monitor, connected or not)
+        favorites = load_favorites()
+        if favorites:
+            # One block per saved monitor
+            fav_menu_items = []
+
+            for dev_path, fav in sorted(favorites.items(), key=lambda x: x[1].get("friendly_name", "")):
+                label = f'Primary: {fav.get("friendly_name", "Unknown")}  —  {fav.get("width", "?")}×{fav.get("height", "?")} @ {fav.get("hz", "?")} Hz  [{fav.get("scale", "?")}%]'
+                auto = fav.get("auto_restore", True)
+                sec = fav.get("secondary", None)
+
+                fav_menu_items.append(pystray.MenuItem(
+                    label,
+                    None, enabled=False
+                ))
+                fav_menu_items.append(pystray.MenuItem(
+                    'Auto-restore at startup',
+                    self._make_toggle_auto_restore_handler(dev_path),
+                    checked=lambda item, a=auto: a,
+                ))
+                fav_menu_items.append(pystray.MenuItem(
+                    '↺ Restore Now (Primary)',
+                    self._make_restore_favorite_by_key_handler(dev_path)
+                ))
+
+                if sec:
+                    sec_label = f'  Secondary: {sec.get("width", "?")}×{sec.get("height", "?")} @ {sec.get("hz", "?")} Hz  [{sec.get("scale", "?")}%]'
+                    fav_menu_items.append(pystray.MenuItem(
+                        sec_label,
+                        None, enabled=False
+                    ))
+                    fav_menu_items.append(pystray.MenuItem(
+                        '↺ Secondary Mode',
+                        self._make_restore_secondary_by_key_handler(dev_path)
+                    ))
+
+                fav_menu_items.append(pystray.MenuItem(
+                    '✖ Remove',
+                    self._make_remove_favorite_handler(dev_path)
+                ))
+                fav_menu_items.append(pystray.Menu.SEPARATOR)
+
+            items.append(pystray.MenuItem(
+                '★ Favorites',
+                pystray.Menu(*fav_menu_items[:-1])
+            ))
+
+            # Restore everything in one click
+            items.append(pystray.MenuItem(
+                '↺ Restore All Favorites',
+                self._make_restore_all_handler()
+            ))
 
             items.append(pystray.Menu.SEPARATOR)
 
@@ -718,6 +924,351 @@ class ScaleSwitchApp:
             self._apply_display_mode(gdi_name, w, h, hz)
         return handler
 
+    def _make_rotate_handler(self, gdi_name: str):
+        def handler(icon, item):
+            self._rotate_screen(gdi_name)
+        return handler
+
+    # ─── Favorites ───────────────────────────────────────────────────────
+
+    def _make_save_favorite_handler(self, mon: dict):
+        """Save the monitor's current resolution/refresh/scale as its favorite."""
+        dev_path = mon["device_path"]
+        if not dev_path:
+            # Fall back to the GDI name when no stable device path is available
+            dev_path = f"__unknown__{mon['gdi_name']}"
+
+        def handler(icon, item):
+            with self._lock:
+                try:
+
+                    current_mode = get_current_display_mode(mon["gdi_name"])
+                    dpi_info = _get_dpi_scaling_info(
+                        _make_luid(mon["adapter_lo"], mon["adapter_hi"]),
+                        mon["source_id"]
+                    )
+
+                    width = current_mode["width"] if current_mode else mon["current_res"][0]
+                    height = current_mode["height"] if current_mode else mon["current_res"][1]
+                    hz = current_mode["hz"] if current_mode else mon["current_hz"]
+                    scale = dpi_info["current"] if dpi_info else mon["scale"]
+
+                    favorites = load_favorites()
+                    favorites[dev_path] = {
+                        "friendly_name": mon["friendly_name"],
+                        "width": width,
+                        "height": height,
+                        "hz": hz,
+                        "scale": scale,
+                        "auto_restore": True,
+                    }
+                    save_favorites(favorites)
+
+                    self._refresh_icon()
+                    if self.icon:
+                        self.icon.notify(
+                            f'Favorite saved: {mon["friendly_name"]} — '
+                            f'{width}×{height} @ {hz} Hz, {scale}%',
+                            APP_NAME
+                        )
+                except Exception as e:
+                    if self.icon:
+                        self.icon.notify(f"Error saving favorite: {e}", APP_NAME)
+
+        return handler
+
+    def _make_restore_favorite_handler(self, mon: dict):
+        """Restore the saved primary favorite for a connected monitor."""
+        dev_path = mon["device_path"]
+        if not dev_path:
+            dev_path = f"__unknown__{mon['gdi_name']}"
+
+        def handler(icon, item):
+            self._apply_favorite_for_monitor(mon)
+
+        return handler
+
+    def _make_restore_favorite_by_key_handler(self, dev_path: str):
+        """Restore a favorite identified by its stored device path."""
+        def handler(icon, item):
+            with self._lock:
+                try:
+                    favorites = load_favorites()
+                    fav = favorites.get(dev_path)
+                    if not fav:
+                        if self.icon:
+                            self.icon.notify("Favorite not found", APP_NAME)
+                        return
+
+                    # The monitor must currently be connected
+                    monitors = self._get_monitors()
+                    mon = next((m for m in monitors if m["device_path"] == dev_path), None)
+
+                    if not mon:
+                        if self.icon:
+                            self.icon.notify(
+                                f'Monitor \'{fav.get("friendly_name", "?")}\' not found',
+                                APP_NAME
+                            )
+                        return
+
+                    self._apply_favorite_for_monitor(mon)
+                except Exception as e:
+                    if self.icon:
+                        self.icon.notify(f"Error: {e}", APP_NAME)
+
+        return handler
+
+    def _make_restore_secondary_by_key_handler(self, dev_path: str):
+        """Apply the stored secondary mode for a favorite by device path."""
+        def handler(icon, item):
+            with self._lock:
+                try:
+                    favorites = load_favorites()
+                    fav = favorites.get(dev_path)
+                    if not fav or "secondary" not in fav:
+                        if self.icon:
+                            self.icon.notify("No secondary mode saved", APP_NAME)
+                        return
+
+                    monitors = self._get_monitors()
+                    mon = next((m for m in monitors if m["device_path"] == dev_path), None)
+
+                    if not mon:
+                        if self.icon:
+                            self.icon.notify(
+                                f'Monitor \'{fav.get("friendly_name", "?")}\' not found',
+                                APP_NAME
+                            )
+                        return
+
+                    self._apply_secondary_for_monitor(mon)
+                except Exception as e:
+                    if self.icon:
+                        self.icon.notify(f"Error: {e}", APP_NAME)
+
+        return handler
+
+    def _apply_favorite_for_monitor(self, mon: dict):
+        """Apply the stored primary favorite (scale + mode) to a monitor."""
+        with self._lock:
+            try:
+                favorites = load_favorites()
+                dev_path = mon.get("device_path", "")
+                if not dev_path:
+                    dev_path = f"__unknown__{mon['gdi_name']}"
+                fav = favorites.get(dev_path)
+                if not fav:
+                    if self.icon:
+                        self.icon.notify("No favorite saved for this monitor", APP_NAME)
+                    return
+
+                gdi = mon["gdi_name"]
+                a_lo, a_hi, s_id = mon["adapter_lo"], mon["adapter_hi"], mon["source_id"]
+
+                # Scale first — it is cheap and does not reset the mode
+                adapter_id = _make_luid(a_lo, a_hi)
+                set_dpi_scale(adapter_id, s_id, fav["scale"])
+
+                # Then resolution + refresh rate
+                set_display_mode(gdi, fav["width"], fav["height"], fav["hz"])
+
+                self._refresh_icon()
+                if self.icon:
+                    self.icon.notify(
+                        f'Favorite restored: {mon["friendly_name"]} — '
+                        f'{fav["width"]}×{fav["height"]} @ {fav["hz"]} Hz, {fav["scale"]}%',
+                        APP_NAME
+                    )
+            except Exception as e:
+                if self.icon:
+                    self.icon.notify(f"Error restoring favorite: {e}", APP_NAME)
+
+    def _make_remove_favorite_handler(self, dev_path: str):
+        """Delete every favorite entry stored for a device path."""
+        def handler(icon, item):
+            with self._lock:
+                try:
+                    favorites = load_favorites()
+                    removed_name = favorites.get(dev_path, {}).get("friendly_name", "Unknown")
+                    if dev_path in favorites:
+                        del favorites[dev_path]
+                        save_favorites(favorites)
+                    self._refresh_icon()
+                    if self.icon:
+                        self.icon.notify(f"Favorite removed: {removed_name}", APP_NAME)
+                except Exception as e:
+                    if self.icon:
+                        self.icon.notify(f"Error: {e}", APP_NAME)
+
+        return handler
+
+    # ─── Secondary ("alternate") mode ────────────────────────────────────
+
+    def _make_save_secondary_handler(self, mon: dict):
+        """Store the monitor's current state as its alternate ("secondary") mode."""
+        dev_path = mon["device_path"]
+        if not dev_path:
+            dev_path = f"__unknown__{mon['gdi_name']}"
+
+        def handler(icon, item):
+            with self._lock:
+                try:
+                    current_mode = get_current_display_mode(mon["gdi_name"])
+                    dpi_info = _get_dpi_scaling_info(
+                        _make_luid(mon["adapter_lo"], mon["adapter_hi"]),
+                        mon["source_id"]
+                    )
+
+                    width = current_mode["width"] if current_mode else mon["current_res"][0]
+                    height = current_mode["height"] if current_mode else mon["current_res"][1]
+                    hz = current_mode["hz"] if current_mode else mon["current_hz"]
+                    scale = dpi_info["current"] if dpi_info else mon["scale"]
+
+                    favorites = load_favorites()
+                    if dev_path not in favorites:
+                        # Seed the primary entry so the secondary has a parent
+                        favorites[dev_path] = {
+                            "friendly_name": mon["friendly_name"],
+                            "width": width,
+                            "height": height,
+                            "hz": hz,
+                            "scale": scale,
+                            "auto_restore": True,
+                        }
+                    favorites[dev_path]["secondary"] = {
+                        "width": width,
+                        "height": height,
+                        "hz": hz,
+                        "scale": scale,
+                    }
+                    save_favorites(favorites)
+
+                    self._refresh_icon()
+                    if self.icon:
+                        self.icon.notify(
+                            f'Secondary saved: {mon["friendly_name"]} — '
+                            f'{width}×{height} @ {hz} Hz, {scale}%',
+                            APP_NAME
+                        )
+                except Exception as e:
+                    if self.icon:
+                        self.icon.notify(f"Error saving secondary: {e}", APP_NAME)
+
+        return handler
+
+    def _make_apply_secondary_handler(self, mon: dict):
+        """Switch a connected monitor to its stored secondary mode."""
+        def handler(icon, item):
+            self._apply_secondary_for_monitor(mon)
+
+        return handler
+
+    def _apply_secondary_for_monitor(self, mon: dict):
+        """Apply the stored secondary mode (scale + resolution) to a monitor."""
+        with self._lock:
+            try:
+                favorites = load_favorites()
+                dev_path = mon.get("device_path", "")
+                if not dev_path:
+                    dev_path = f"__unknown__{mon['gdi_name']}"
+                fav = favorites.get(dev_path)
+                if not fav or "secondary" not in fav:
+                    if self.icon:
+                        self.icon.notify("No secondary mode saved for this monitor", APP_NAME)
+                    return
+
+                sec = fav["secondary"]
+                gdi = mon["gdi_name"]
+                a_lo, a_hi, s_id = mon["adapter_lo"], mon["adapter_hi"], mon["source_id"]
+
+                # Scale first, same ordering as the primary favorite
+                adapter_id = _make_luid(a_lo, a_hi)
+                set_dpi_scale(adapter_id, s_id, sec["scale"])
+
+                # Then resolution + refresh rate
+                set_display_mode(gdi, sec["width"], sec["height"], sec["hz"])
+
+                self._refresh_icon()
+                if self.icon:
+                    self.icon.notify(
+                        f'Secondary applied: {mon["friendly_name"]} — '
+                        f'{sec["width"]}×{sec["height"]} @ {sec["hz"]} Hz, {sec["scale"]}%',
+                        APP_NAME
+                    )
+            except Exception as e:
+                if self.icon:
+                    self.icon.notify(f"Error applying secondary: {e}", APP_NAME)
+
+    def _make_toggle_auto_restore_handler(self, dev_path: str):
+        """Toggle whether a favorite is reapplied when ScaleSwitch starts."""
+        def handler(icon, item):
+            with self._lock:
+                try:
+                    favorites = load_favorites()
+                    if dev_path in favorites:
+                        current = favorites[dev_path].get("auto_restore", True)
+                        favorites[dev_path]["auto_restore"] = not current
+                        save_favorites(favorites)
+                    self._refresh_icon()
+                except Exception as e:
+                    if self.icon:
+                        self.icon.notify(f"Error: {e}", APP_NAME)
+
+        return handler
+
+    def _make_restore_all_handler(self):
+        """Menu handler for the "Restore All Favorites" entry."""
+        def handler(icon, item):
+            self._restore_all_favorites()
+
+        return handler
+
+    def _restore_all_favorites(self):
+        """Reapply every auto-restore favorite for currently connected monitors."""
+        with self._lock:
+            try:
+                favorites = load_favorites()
+                if not favorites:
+                    if self.icon:
+                        self.icon.notify("No favorites saved", APP_NAME)
+                    return
+
+                monitors = self._get_monitors()
+                restored = 0
+                errors = []
+
+                for dev_path, fav in favorites.items():
+                    if not fav.get("auto_restore", True):
+                        continue
+
+                    mon = next((m for m in monitors if m["device_path"] == dev_path), None)
+                    if not mon:
+                        errors.append(f'{fav.get("friendly_name", "?")} (not connected)')
+                        continue
+
+                    try:
+                        gdi = mon["gdi_name"]
+                        adapter_id = _make_luid(mon["adapter_lo"], mon["adapter_hi"])
+                        set_dpi_scale(adapter_id, mon["source_id"], fav["scale"])
+                        set_display_mode(gdi, fav["width"], fav["height"], fav["hz"])
+                        restored += 1
+                    except Exception as e:
+                        errors.append(f'{fav.get("friendly_name", "?")}: {e}')
+
+                self._refresh_icon()
+                if self.icon:
+                    msg = f"Restored {restored} monitor(s)"
+                    if errors:
+                        msg += f' | Errors: {", ".join(errors[:3])}'
+                    self.icon.notify(msg, APP_NAME)
+
+            except Exception as e:
+                if self.icon:
+                    self.icon.notify(f"Error: {e}", APP_NAME)
+
+    # ─── Apply helpers ───────────────────────────────────────────────────
+
     def _apply_display_mode(self, gdi_name: str, w: int, h: int, hz: int):
         with self._lock:
             try:
@@ -725,12 +1276,24 @@ class ScaleSwitchApp:
                 self._refresh_icon()
                 if self.icon:
                     self.icon.notify(
-                        f"{w}\u00d7{h} @ {hz} Hz",
+                        f"{w}×{h} @ {hz} Hz",
                         APP_NAME
                     )
             except Exception as e:
                 if self.icon:
                     self.icon.notify(f"Error: {e}", APP_NAME)
+
+    def _rotate_screen(self, gdi_name: str):
+        with self._lock:
+            try:
+                new_orientation = toggle_display_orientation(gdi_name)
+                self._refresh_icon()
+                label = "Portrait" if new_orientation != DMDO_DEFAULT else "Landscape"
+                if self.icon:
+                    self.icon.notify(f"Screen rotated to {label}", APP_NAME)
+            except Exception as e:
+                if self.icon:
+                    self.icon.notify(f"Error rotating screen: {e}", APP_NAME)
 
     def _apply_scale(self, a_lo: int, a_hi: int, source_id: int, scale: int):
         with self._lock:
@@ -770,13 +1333,57 @@ class ScaleSwitchApp:
             (m["scale"] for m in monitors if m["primary"]), 100
         )
 
-        self.icon = pystray.Icon(
+        self.icon = _TrayIcon(
             APP_NAME,
             icon=create_tray_icon(primary_scale),
-            title=f"{APP_NAME} \u2014 Scale: {primary_scale}%",
+            title=f"{APP_NAME} — Scale: {primary_scale}%",
             menu=self._build_menu(),
         )
+
+        # Reapply saved favorites before the tray loop takes over
+        self._auto_restore_on_startup()
+
         self.icon.run()
+
+    def _auto_restore_on_startup(self):
+        """Reapply auto-restore favorites once, at application startup."""
+        try:
+            favorites = load_favorites()
+            if not favorites:
+                return
+
+            monitors = self._get_monitors()
+            any_restored = False
+
+            for dev_path, fav in favorites.items():
+                if not fav.get("auto_restore", True):
+                    continue
+                mon = next((m for m in monitors if m["device_path"] == dev_path), None)
+                if not mon:
+                    continue
+
+                try:
+                    gdi = mon["gdi_name"]
+                    adapter_id = _make_luid(mon["adapter_lo"], mon["adapter_hi"])
+
+                    # Scale first, then resolution + refresh rate
+                    set_dpi_scale(adapter_id, mon["source_id"], fav["scale"])
+
+                    set_display_mode(gdi, fav["width"], fav["height"], fav["hz"])
+
+                    any_restored = True
+                    print(f'Auto-restored favorite for {mon["friendly_name"]}: '
+                          f'{fav["width"]}×{fav["height"]} @ {fav["hz"]} Hz, {fav["scale"]}%')
+                except Exception as e:
+                    print(f'Auto-restore failed for {mon["friendly_name"]}: {e}')
+
+            if any_restored:
+                # The menu is rebuilt lazily on first open, so there is
+                # nothing else to refresh here.
+                return
+
+        except Exception as e:
+            print(f"Auto-restore startup error: {e}")
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
